@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB};
 use uci::{
     GoLimits, LEVELS, Level, Score, UciCommand, format_bestmove, format_info, parse_command,
 };
@@ -77,7 +78,8 @@ fn run(input: impl BufRead, output: &Output, mut strength: Strength) {
     let mut fen = STARTPOS_FEN.to_string();
     let mut moves: Vec<String> = Vec::new();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut idle = Some(Engine::new());
+    let mut hash_mb = DEFAULT_HASH_MB;
+    let mut idle = Some(Engine::with_hash_mb(hash_mb));
     let mut search: Option<JoinHandle<Engine>> = None;
 
     for line in input.lines() {
@@ -86,6 +88,10 @@ fn run(input: impl BufRead, output: &Output, mut strength: Strength) {
             UciCommand::Uci => {
                 say!(output, "id name chess-engine {}", env!("CARGO_PKG_VERSION"));
                 say!(output, "id author geniom");
+                say!(
+                    output,
+                    "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
+                );
                 say!(
                     output,
                     "option name Slack type spin default 0 min 0 max {MAX_SLACK_CP}"
@@ -98,6 +104,21 @@ fn run(input: impl BufRead, output: &Output, mut strength: Strength) {
                 say!(output, "uciok");
             }
             UciCommand::IsReady => say!(output, "readyok"),
+            UciCommand::SetOption(option) if option.named("hash") => {
+                let Some(megabytes) = parsed_hash(&option.value) else {
+                    eprintln!(
+                        "unreadable hash size {}, staying at {hash_mb} MB",
+                        option.value.trim()
+                    );
+                    continue;
+                };
+                hash_mb = megabytes;
+                finish(&stop, &mut search, &mut idle);
+                match idle.as_mut() {
+                    Some(engine) => engine.resize_table(hash_mb),
+                    None => idle = Some(Engine::with_hash_mb(hash_mb)),
+                }
+            }
             UciCommand::SetOption(option) if option.named("slack") => {
                 strength.slack_cp = parsed_slack(&option.value);
             }
@@ -126,7 +147,7 @@ fn run(input: impl BufRead, output: &Output, mut strength: Strength) {
             UciCommand::Go(limits) => {
                 finish(&stop, &mut search, &mut idle);
                 stop.store(false, Ordering::Relaxed);
-                let mut engine = idle.take().unwrap_or_default();
+                let mut engine = idle.take().unwrap_or_else(|| Engine::with_hash_mb(hash_mb));
                 let refs: Vec<&str> = moves.iter().map(String::as_str).collect();
                 if engine.set_position(&fen, &refs).is_none() {
                     idle = Some(engine);
@@ -254,6 +275,11 @@ fn parsed_slack(value: &str) -> i32 {
     value.trim().parse().unwrap_or(0).clamp(0, MAX_SLACK_CP)
 }
 
+fn parsed_hash(value: &str) -> Option<usize> {
+    let megabytes: usize = value.trim().parse().ok()?;
+    Some(megabytes.clamp(MIN_HASH_MB, MAX_HASH_MB))
+}
+
 fn search_limits(limits: GoLimits, side: Color, strength: Strength) -> SearchLimits {
     if limits.infinite {
         return SearchLimits {
@@ -356,8 +382,9 @@ fn run_perft(output: &Output, fen: &str, moves: &[String], depth: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SLACK_CP, MOVE_OVERHEAD_MS, Strength, flag_value, level_names, nodes_per_second,
-        parsed_slack, reported_score, requested_level, run, search_limits,
+        MAX_HASH_MB, MAX_SLACK_CP, MIN_HASH_MB, MOVE_OVERHEAD_MS, Strength, flag_value,
+        level_names, nodes_per_second, parsed_hash, parsed_slack, reported_score, requested_level,
+        run, search_limits,
     };
     use crate::board::Color;
     use crate::search::MATE_SCORE;
@@ -684,6 +711,22 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_size_is_kept_within_bounds_and_an_unreadable_one_is_refused() {
+        let cases = [
+            ("64", Some(64)),
+            (" 128 ", Some(128)),
+            ("0", Some(MIN_HASH_MB)),
+            ("999999", Some(MAX_HASH_MB)),
+            ("-16", None),
+            ("nonsense", None),
+            ("", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(parsed_hash(value), expected, "value {value:?}");
+        }
+    }
+
+    #[test]
     fn a_score_reaches_the_protocol_as_a_move_count_or_in_centipawns() {
         let cases = [
             (MATE_SCORE - 3, Score::MateIn(2)),
@@ -732,7 +775,7 @@ mod tests {
 
     #[test]
     fn what_a_session_went_through_shows_in_its_next_search() {
-        let cases: [(&[Step], &str, Against, &str); 4] = [
+        let cases: [(&[Step], &str, Against, &str); 6] = [
             (
                 &[Step::Search(SEARCH)],
                 SEARCH,
@@ -744,6 +787,24 @@ mod tests {
                 SEARCH,
                 Against::SameNodes,
                 "a new game forgets what the last one filled in",
+            ),
+            (
+                &[
+                    Step::Search(SEARCH),
+                    Step::Send("setoption name Hash value 16"),
+                ],
+                SEARCH,
+                Against::SameNodes,
+                "resizing the table forgets what it held",
+            ),
+            (
+                &[
+                    Step::Search(SEARCH),
+                    Step::Send("setoption name Hash value nonsense"),
+                ],
+                SEARCH,
+                Against::FewerNodes,
+                "an unreadable hash size leaves the table as it was",
             ),
             (
                 &[Step::Send("setoption name Slack value 100")],
@@ -808,6 +869,7 @@ mod tests {
         let greeting = EngineSession::start().greeting();
         for advertised in [
             "id name chess-engine",
+            "option name Hash type spin",
             "option name Slack type spin",
             "option name Level type combo",
         ] {

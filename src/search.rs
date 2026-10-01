@@ -1,7 +1,7 @@
 use crate::board::{Board, Color, Piece, PieceKind, drawn_in_search};
 use crate::eval::{evaluate, piece_value};
 use crate::movegen::Move;
-use crate::tt::{Bound, Hit, TranspositionTable};
+use crate::tt::{Bound, DEFAULT_HASH_MB, Hit, TranspositionTable};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -83,15 +83,23 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Self {
+        Self::with_hash_mb(DEFAULT_HASH_MB)
+    }
+
+    pub fn with_hash_mb(megabytes: usize) -> Self {
         Engine {
             board: Board::startpos(),
             history: Vec::new(),
-            table: TranspositionTable::new(),
+            table: TranspositionTable::with_megabytes(megabytes),
         }
     }
 
     pub fn clear_table(&mut self) {
         self.table.clear();
+    }
+
+    pub fn resize_table(&mut self, megabytes: usize) {
+        self.table.resize(megabytes);
     }
 
     pub fn set_position(&mut self, fen: &str, moves: &[&str]) -> Option<()> {

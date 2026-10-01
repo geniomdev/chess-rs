@@ -1,13 +1,18 @@
 use crate::movegen::Move;
 
-const HASH_MB: usize = 16;
+pub(crate) const DEFAULT_HASH_MB: usize = 16;
+pub(crate) const MIN_HASH_MB: usize = 1;
+pub(crate) const MAX_HASH_MB: usize = 4096;
 const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
-const REQUESTED_ENTRIES: usize = (HASH_MB << 20) / ENTRY_BYTES;
-const ENTRY_COUNT: usize = if REQUESTED_ENTRIES.is_power_of_two() {
-    REQUESTED_ENTRIES
-} else {
-    REQUESTED_ENTRIES.next_power_of_two() >> 1
-};
+
+fn entry_count(megabytes: usize) -> usize {
+    let requested = (megabytes.clamp(MIN_HASH_MB, MAX_HASH_MB) << 20) / ENTRY_BYTES;
+    if requested.is_power_of_two() {
+        requested
+    } else {
+        requested.next_power_of_two() >> 1
+    }
+}
 
 const BOUND_MASK: u8 = 0b11;
 const GENERATION_SHIFT: u32 = 2;
@@ -61,12 +66,23 @@ pub(crate) struct TranspositionTable {
 }
 
 impl TranspositionTable {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_megabytes(DEFAULT_HASH_MB)
+    }
+
+    pub(crate) fn with_megabytes(megabytes: usize) -> Self {
+        let count = entry_count(megabytes);
         TranspositionTable {
-            entries: vec![Entry::default(); ENTRY_COUNT],
-            mask: ENTRY_COUNT - 1,
+            entries: vec![Entry::default(); count],
+            mask: count - 1,
             generation: 0,
         }
+    }
+
+    pub(crate) fn resize(&mut self, megabytes: usize) {
+        self.entries = Vec::new();
+        *self = Self::with_megabytes(megabytes);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -241,6 +257,28 @@ mod tests {
     #[test]
     fn four_entries_share_a_cache_line() {
         assert_eq!(super::ENTRY_BYTES, 16);
-        assert_eq!(super::ENTRY_COUNT, 1 << 20);
+    }
+
+    #[test]
+    fn the_table_holds_as_many_entries_as_fit_in_the_asked_megabytes() {
+        let cases = [
+            (super::DEFAULT_HASH_MB, 1 << 20),
+            (1, 1 << 16),
+            (24, 1 << 20),
+            (0, 1 << 16),
+            (usize::MAX, super::MAX_HASH_MB << 16),
+        ];
+        for (megabytes, expected) in cases {
+            assert_eq!(super::entry_count(megabytes), expected, "{megabytes} MB");
+        }
+    }
+
+    #[test]
+    fn resizing_forgets_what_the_table_held() {
+        let mut table = TranspositionTable::new();
+        table.store(KEY, 8, 42, Bound::Exact, Move::NONE);
+        table.resize(1);
+        assert_eq!(table.entries.len(), 1 << 16);
+        assert!(table.probe(KEY).is_none());
     }
 }
